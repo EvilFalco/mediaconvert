@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""Convert PNG/JPG → WebP, MP4 → WebM and MP3 → OGG, preserving folder structure."""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+VIDEO_EXTENSIONS = {".mp4"}
+AUDIO_EXTENSIONS = {".mp3"}
+
+LARGE_FILE_THRESHOLD = 20 * 1024 * 1024
+LARGE_FILE_WORKERS = 2
+WEBP_MAX_DIM = 16383
+
+
+# ── image conversion ──────────────────────────────────────────────────────────
+
+def convert_image(args: tuple) -> tuple[Path, Path | None, str, bool]:
+    src, dst, quality, method = args
+    try:
+        from PIL import Image
+        Image.MAX_IMAGE_PIXELS = None
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with Image.open(src) as img:
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                img = img.convert("RGBA")
+            else:
+                img = img.convert("RGB")
+            if max(img.size) > WEBP_MAX_DIM:
+                scale = WEBP_MAX_DIM / max(img.size)
+                img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+            try:
+                img.save(dst, "WEBP", quality=quality, method=method)
+            except (ValueError, OSError):
+                img.save(dst, "WEBP", lossless=True, method=method)
+                return src, dst, "", True
+        return src, dst, "", False
+    except Exception as e:
+        return src, None, str(e), False
+
+
+# ── video + audio conversion ──────────────────────────────────────────────────
+
+# quality 0–10 → Opus bitrate in kbps
+_OPUS_BITRATES = [32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 320]
+
+
+def get_duration_s(src: Path) -> float | None:
+    """Return file duration in seconds via ffprobe, or None on failure."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(src)],
+            capture_output=True, text=True,
+        )
+        return float(json.loads(result.stdout)["format"]["duration"])
+    except Exception:
+        return None
+
+
+def run_ffmpeg(cmd: list[str], prefix: str, duration_s: float | None) -> str:
+    """Run ffmpeg with real-time progress bar. Returns error string or ''."""
+    progress_cmd = [cmd[0], "-progress", "pipe:1", "-nostats"] + cmd[1:]
+    proc = subprocess.Popen(progress_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    for line in proc.stdout:
+        if line.startswith("out_time_us="):
+            try:
+                elapsed_s = int(line.split("=", 1)[1]) / 1_000_000
+                if duration_s and duration_s > 0:
+                    pct = min(100, int(elapsed_s / duration_s * 100))
+                    filled = pct // 5
+                    bar = "█" * filled + "░" * (20 - filled)
+                    print(f"\r{prefix}  [{bar}] {pct:3d}%", end="", flush=True)
+            except ValueError:
+                pass
+
+    proc.wait()
+    if proc.returncode != 0:
+        lines = [l for l in proc.stderr.read().splitlines() if l.strip()]
+        return lines[-1] if lines else "ffmpeg error"
+    return ""
+
+
+def convert_video(src: Path, dst: Path, crf: int, prefix: str) -> tuple[Path, Path | None, str]:
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        duration_s = get_duration_s(src)
+        cmd = [
+            "ffmpeg", "-y", "-i", str(src),
+            "-c:v", "libvpx-vp9", "-crf", str(crf), "-b:v", "0",
+            "-c:a", "libopus",
+            "-threads", "0",
+            str(dst),
+        ]
+        err = run_ffmpeg(cmd, prefix, duration_s)
+        return (src, None, err) if err else (src, dst, "")
+    except Exception as e:
+        return src, None, str(e)
+
+
+def convert_audio(src: Path, dst: Path, quality: int, prefix: str) -> tuple[Path, Path | None, str]:
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        duration_s = get_duration_s(src)
+        bitrate = f"{_OPUS_BITRATES[max(0, min(10, quality))]}k"
+        cmd = [
+            "ffmpeg", "-y", "-i", str(src),
+            "-c:a", "libopus", "-b:a", bitrate, "-vbr", "on",
+            str(dst),
+        ]
+        err = run_ffmpeg(cmd, prefix, duration_s)
+        return (src, None, err) if err else (src, dst, "")
+    except Exception as e:
+        return src, None, str(e)
+
+
+# ── shared helpers ────────────────────────────────────────────────────────────
+
+def find_files(source: Path, extensions: set) -> list[Path]:
+    return [
+        p for p in source.rglob("*")
+        if p.suffix.lower() in extensions and p.is_file()
+    ]
+
+
+def verify(dst: Path) -> str | None:
+    if not dst.exists():
+        return "output file missing"
+    if dst.stat().st_size == 0:
+        return "output file is empty"
+    return None
+
+
+def sanitize_filename(stem: str) -> str:
+    """Transliterate Cyrillic → Latin, replace spaces with underscores."""
+    try:
+        from transliterate import translit
+        stem = translit(stem, "ru", reversed=True)
+    except Exception:
+        pass
+    try:
+        from unidecode import unidecode
+        stem = unidecode(stem)
+    except Exception:
+        pass
+    stem = stem.lower()
+    stem = re.sub(r"[\s\-]+", "_", stem)   # spaces/dashes → underscore
+    stem = re.sub(r"[^\w]", "", stem)       # remove everything except letters, digits, _
+    stem = re.sub(r"_+", "_", stem)         # collapse repeated underscores
+    return stem.strip("_")
+
+
+def make_dst(src: Path, source: Path, out_root: Path, out_ext: str, rename: bool) -> Path:
+    rel = src.relative_to(source)
+    stem = sanitize_filename(rel.stem) if rename else rel.stem
+    return out_root / rel.parent / (stem + out_ext)
+
+
+def partition(files: list[Path], out_root: Path, source: Path, out_ext: str, rename: bool):
+    """Split files into (already_done, to_convert). Detect dst collisions and rename with _(conflict)."""
+    already, to_convert = [], []
+    conflicts: list[tuple[Path, Path, Path]] = []  # (conflict_src, intended_dst, first_src)
+    seen: dict[Path, Path] = {}  # dst → first src that claimed it
+
+    for src in files:
+        dst = make_dst(src, source, out_root, out_ext, rename)
+        if dst in seen:
+            conflicts.append((src, dst, seen[dst]))
+            dst = dst.parent / (dst.stem + "_(conflict)" + dst.suffix)
+        else:
+            seen[dst] = src
+        (already if dst.exists() else to_convert).append((src, dst))
+
+    return already, to_convert, conflicts
+
+
+def confirm(prompt: str) -> bool:
+    try:
+        return input(prompt).strip().lower() in ("y", "yes", "д", "да")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="mediaconvert",
+        description="Convert PNG/JPG → WebP, MP4 → WebM and MP3 → OGG, preserving folder structure.",
+    )
+    parser.add_argument("source", type=Path, nargs="?", default=Path("."),
+                        help="source directory (default: current directory)")
+    parser.add_argument("--output", "-o", type=Path, default=None,
+                        help="output directory (default: convert in place)")
+    parser.add_argument("--quality", "-q", type=int, default=85,
+                        help="WebP quality 1–100 (default: 85)")
+    parser.add_argument("--crf", type=int, default=33,
+                        help="VP9 CRF quality 0–63, lower=better (default: 33)")
+    parser.add_argument("--audio-quality", "-aq", type=int, default=4,
+                        help="Opus bitrate level 0–10, higher=better (default: 4 = 96kbps)")
+    parser.add_argument("--dry-run", "-n", action="store_true",
+                        help="show what would be done, make no changes")
+    parser.add_argument("--keep-originals", "-k", action="store_true",
+                        help="do not delete source files after conversion")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="skip confirmation prompt")
+    parser.add_argument("--rename", "-r", action="store_true",
+                        help="transliterate Cyrillic → Latin and replace spaces with _ in output filenames")
+    parser.add_argument("--workers", "-j", type=int, default=os.cpu_count(),
+                        help=f"parallel workers for images (default: {os.cpu_count()})")
+    args = parser.parse_args()
+
+    source = args.source.resolve()
+    if not source.is_dir():
+        sys.exit(f"error: '{source}' is not a directory")
+
+    out_root = args.output.resolve() if args.output else source
+
+    images = find_files(source, IMAGE_EXTENSIONS)
+    videos = find_files(source, VIDEO_EXTENSIONS)
+    audios = find_files(source, AUDIO_EXTENSIONS)
+
+    if not images and not videos and not audios:
+        print("No PNG/JPG/MP4/MP3 files found.")
+        return
+
+    img_already, img_convert, img_conflicts = partition(images, out_root, source, ".webp", args.rename)
+    vid_already, vid_convert, vid_conflicts = partition(videos, out_root, source, ".webm", args.rename)
+    aud_already, aud_convert, aud_conflicts = partition(audios, out_root, source, ".ogg", args.rename)
+    all_conflicts = img_conflicts + vid_conflicts + aud_conflicts
+
+    # ── summary + confirmation ────────────────────────────────────────────────
+    print()
+    if args.rename:
+        print("  [--rename] Cyrillic → Latin, spaces → _")
+    if all_conflicts:
+        print(f"  ⚠ {len(all_conflicts)} naming conflict(s) — will save with _(conflict) suffix:")
+        for src, intended, first in all_conflicts:
+            print(f"      {src.name} → {intended.stem}_(conflict){intended.suffix}"
+                  f"  (conflicts with {first.name})")
+
+    if images:
+        img_large = sum(1 for src, _ in img_convert if src.stat().st_size >= LARGE_FILE_THRESHOLD)
+        line = f"  Images  (PNG/JPG → WebP):  {len(img_convert):>4} to convert"
+        if img_already:
+            line += f",  {len(img_already)} already done (will skip)"
+        if img_large:
+            line += f"  [{img_large} large, max {LARGE_FILE_WORKERS} at a time]"
+        print(line)
+    if videos:
+        line = f"  Videos  (MP4    → WebM):  {len(vid_convert):>4} to convert"
+        if vid_already:
+            line += f",  {len(vid_already)} already done (will skip)"
+        print(line)
+    if audios:
+        line = f"  Audio   (MP3    → OGG):   {len(aud_convert):>4} to convert"
+        if aud_already:
+            line += f",  {len(aud_already)} already done (will skip)"
+        print(line)
+    print()
+
+    if args.dry_run:
+        for src, dst in img_already + vid_already + aud_already:
+            print(f"  SKIP  {src.name}  (output exists)")
+        for src, dst in img_convert + vid_convert + aud_convert:
+            marker = "  [in-place]" if dst.parent == src.parent else ""
+            print(f"  CONV  {src.name}  →  {dst}{marker}")
+        print("\nDry run — nothing changed.")
+        return
+
+    nothing_to_do = not img_convert and not vid_convert and not aud_convert
+    if nothing_to_do:
+        print("Nothing to convert — all files already have outputs.")
+        if not args.keep_originals and (img_already or vid_already or aud_already):
+            total_skip = len(img_already) + len(vid_already) + len(aud_already)
+            if not args.yes and not confirm(f"Delete {total_skip} original(s) whose outputs already exist? [y/N] "):
+                print("Aborted.")
+                return
+        # fall through to deletion
+    else:
+        if not args.yes and not confirm("Proceed? [y/N] "):
+            print("Aborted.")
+            return
+
+    failed: list[tuple[Path, str]] = []
+    converted: list[tuple[Path, Path]] = list(img_already) + list(vid_already) + list(aud_already)
+
+    # ── images ────────────────────────────────────────────────────────────────
+    if img_convert:
+        print(f"\nConverting {len(img_convert)} image(s)...")
+        normal_tasks = [
+            (src, dst, args.quality, 6)
+            for src, dst in img_convert if src.stat().st_size < LARGE_FILE_THRESHOLD
+        ]
+        large_tasks = [
+            (src, dst, args.quality, 1)
+            for src, dst in img_convert if src.stat().st_size >= LARGE_FILE_THRESHOLD
+        ]
+
+        total_img = len(img_convert)
+        width = len(str(total_img))
+        done = 0
+
+        with (
+            ProcessPoolExecutor(max_workers=args.workers) as normal_pool,
+            ProcessPoolExecutor(max_workers=LARGE_FILE_WORKERS) as large_pool,
+        ):
+            futures = {normal_pool.submit(convert_image, t): t for t in normal_tasks}
+            futures |= {large_pool.submit(convert_image, t): t for t in large_tasks}
+            for future in as_completed(futures):
+                src, dst, err, lossless_fallback = future.result()
+                done += 1
+                pct = done * 100 // total_img
+                if err:
+                    failed.append((src, err))
+                    print(f"  [{done:{width}}/{total_img} {pct:3d}%] FAIL  {src.name}: {err}")
+                else:
+                    err2 = verify(dst)
+                    if err2:
+                        failed.append((src, err2))
+                        print(f"  [{done:{width}}/{total_img} {pct:3d}%] FAIL  {src.name}: {err2}")
+                    else:
+                        converted.append((src, dst))
+                        src_kb = src.stat().st_size / 1024
+                        dst_kb = dst.stat().st_size / 1024
+                        ratio = dst_kb / src_kb * 100
+                        tags = []
+                        if src.stat().st_size >= LARGE_FILE_THRESHOLD:
+                            tags.append("large")
+                        if lossless_fallback:
+                            tags.append("lossless fallback")
+                        tag = f"  [{', '.join(tags)}]" if tags else ""
+                        print(f"  [{done:{width}}/{total_img} {pct:3d}%] OK    {src.name}  "
+                              f"{src_kb:.0f}KB → {dst_kb:.0f}KB  ({ratio:.0f}%){tag}")
+
+    # ── videos ────────────────────────────────────────────────────────────────
+    if vid_convert:
+        print(f"\nConverting {len(vid_convert)} video(s)  CRF={args.crf}...")
+        total_vid = len(vid_convert)
+        width = len(str(total_vid))
+        for i, (src, dst) in enumerate(vid_convert, 1):
+            pct = i * 100 // total_vid
+            src_mb = src.stat().st_size / 1024 / 1024
+            counter = f"[{i:{width}}/{total_vid} {pct:3d}%]"
+            prefix = f"  {counter} {src.name}"
+            print(f"  {counter} ...   {src.name}  ({src_mb:.1f}MB)", end="", flush=True)
+            _, _, err = convert_video(src, dst, args.crf, prefix)
+            if err:
+                failed.append((src, err))
+                print(f"\r  {counter} FAIL  {src.name}: {err}")
+            else:
+                err2 = verify(dst)
+                if err2:
+                    failed.append((src, err2))
+                    print(f"\r  {counter} FAIL  {src.name}: {err2}")
+                else:
+                    converted.append((src, dst))
+                    dst_mb = dst.stat().st_size / 1024 / 1024
+                    ratio = dst_mb / src_mb * 100
+                    print(f"\r  {counter} OK    {src.name}  "
+                          f"{src_mb:.1f}MB → {dst_mb:.1f}MB  ({ratio:.0f}%)"
+                          + " " * 30)  # clear leftover bar chars
+
+    # ── audio ─────────────────────────────────────────────────────────────────
+    if aud_convert:
+        print(f"\nConverting {len(aud_convert)} audio file(s)  quality={args.audio_quality} ({_OPUS_BITRATES[args.audio_quality]}kbps)...")
+        total_aud = len(aud_convert)
+        width = len(str(total_aud))
+        for i, (src, dst) in enumerate(aud_convert, 1):
+            pct = i * 100 // total_aud
+            src_mb = src.stat().st_size / 1024 / 1024
+            counter = f"[{i:{width}}/{total_aud} {pct:3d}%]"
+            prefix = f"  {counter} {src.name}"
+            print(f"  {counter} ...   {src.name}  ({src_mb:.1f}MB)", end="", flush=True)
+            _, _, err = convert_audio(src, dst, args.audio_quality, prefix)
+            if err:
+                failed.append((src, err))
+                print(f"\r  {counter} FAIL  {src.name}: {err}")
+            else:
+                err2 = verify(dst)
+                if err2:
+                    failed.append((src, err2))
+                    print(f"\r  {counter} FAIL  {src.name}: {err2}")
+                else:
+                    converted.append((src, dst))
+                    dst_mb = dst.stat().st_size / 1024 / 1024
+                    ratio = dst_mb / src_mb * 100
+                    print(f"\r  {counter} OK    {src.name}  "
+                          f"{src_mb:.1f}MB → {dst_mb:.1f}MB  ({ratio:.0f}%)"
+                          + " " * 30)  # clear leftover bar chars
+
+    # ── summary ───────────────────────────────────────────────────────────────
+    print()
+    newly = len(converted) - len(img_already) - len(vid_already) - len(aud_already)
+    skipped = len(img_already) + len(vid_already) + len(aud_already)
+    print(f"Converted: {newly}   Skipped: {skipped}   Failed: {len(failed)}")
+    if all_conflicts:
+        print(f"\n⚠ {len(all_conflicts)} naming conflict(s) — check these files manually:")
+        for src, intended, first in all_conflicts:
+            print(f"    {intended.stem}_(conflict){intended.suffix}"
+                  f"  ←  {src.name}  (conflicts with {first.name})")
+
+    if failed:
+        print("\nFailed files:")
+        for src, err in failed:
+            print(f"  {src}: {err}")
+        if not args.keep_originals:
+            print("\nOriginals NOT deleted — fix errors above and re-run.")
+        return
+
+    if args.keep_originals:
+        print("Originals kept (--keep-originals).")
+        return
+
+    all_to_delete = [src for src, _ in converted]
+
+    # when --rename: also collect stale non-renamed output files
+    stale: list[Path] = []
+    if args.rename:
+        actual_dsts = {dst for _, dst in converted}
+        for src, dst in converted:
+            old_dst = out_root / src.relative_to(source).with_suffix(dst.suffix)
+            if old_dst == dst or old_dst in actual_dsts or not old_dst.exists():
+                continue
+            try:
+                same = os.path.samefile(old_dst, dst)
+            except OSError:
+                same = False
+            if not same:
+                stale.append(old_dst)
+
+    total_del = len(all_to_delete) + len(stale)
+    print(f"\nDeleting {len(all_to_delete)} original(s)"
+          + (f" + {len(stale)} stale output(s)..." if stale else "..."))
+    delete_errors = []
+    for path in all_to_delete + stale:
+        try:
+            path.unlink()
+        except Exception as e:
+            delete_errors.append((path, str(e)))
+
+    if delete_errors:
+        print("Could not delete some files:")
+        for path, err in delete_errors:
+            print(f"  {path}: {err}")
+    else:
+        print("Done. All originals removed.")
+
+
+if __name__ == "__main__":
+    main()
