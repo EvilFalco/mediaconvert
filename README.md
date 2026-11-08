@@ -34,12 +34,17 @@ sudo apt install ffmpeg
 
 ### 2. Скрипт
 
-Скопируй файл `mediaconvert` в директорию, которая есть в `$PATH`. Рекомендуется `~/.local/bin/` — она есть на большинстве систем и не требует прав администратора.
+Поставь симлинк на скрипт в репо в директорию, которая есть в `$PATH`. Рекомендуется `~/.local/bin/` — она есть на большинстве систем и не требует прав администратора. Из папки репо:
 
 ```bash
-cp mediaconvert ~/.local/bin/mediaconvert
-chmod +x ~/.local/bin/mediaconvert
+chmod +x mediaconvert
+mkdir -p ~/.local/bin
+ln -sfn "$PWD/mediaconvert" ~/.local/bin/mediaconvert
 ```
+
+С симлинком команда всегда запускает версию из репо: `git pull` обновляет её без переустановки. Переместил репо — выполни `ln -sfn` заново из новой папки.
+
+Если репо держать на машине не нужно, можно скопировать файл: `cp mediaconvert ~/.local/bin/mediaconvert`. Тогда каждое обновление — копировать заново.
 
 ### 3. PATH
 

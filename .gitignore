@@ -2,3 +2,12 @@ __pycache__/
 *.py[cod]
 *.bak
 .DS_Store
+
+# Личное, вне git
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/worktrees/
+
+# Секреты не живут в файлах; на случай, если такой файл всё же появится
+.env
+.env.*
