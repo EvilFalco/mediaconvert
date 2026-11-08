@@ -14,7 +14,7 @@
       "Bash(ls *)",
       "Bash(grep *)",
       "Bash(wc *)",
-      "Bash(python3 -m py_compile /Users/falco/dev/tools/mediaconverter/mediaconvert)"
+      "Bash(python3 -m py_compile *mediaconvert)"
     ],
     "deny": [
       "Read(./.env)",

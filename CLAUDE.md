@@ -8,7 +8,7 @@ CLI на Python: пакетно конвертирует PNG/JPG → WebP, MP4 �
 - Зависимости: `pip3 install Pillow transliterate unidecode`, `brew install ffmpeg` (нужны `ffmpeg` и `ffprobe`).
 - В PATH стоит симлинк `~/.local/bin/mediaconvert` → `mediaconvert` в этом репо. Правка в репо сразу становится рабочей версией.
 - Тестов нет. Проверка после правки:
-  - синтаксис: `python3 -m py_compile /Users/falco/dev/tools/mediaconverter/mediaconvert`;
+  - синтаксис: `python3 -m py_compile ~/dev/tools/mediaconverter/mediaconvert`;
   - прогон: скопировать образцы во временную папку сессии и запустить сначала с `--dry-run`, потом с `--keep-originals`.
 
 ## Где что
@@ -18,7 +18,7 @@ CLI на Python: пакетно конвертирует PNG/JPG → WebP, MP4 �
 
 ## Контекст вне репо
 
-- Сфера: Инструменты (`~/dev/hq/MAP.md`, раздел 7).
+- Плагин `core@hq` — подключён в `.claude/settings.json`.
 - Заметки и задачи: нет.
 
 ## Нельзя трогать
@@ -27,4 +27,4 @@ CLI на Python: пакетно конвертирует PNG/JPG → WebP, MP4 �
 - Логика удаления — «только если всё сконвертировано без ошибок и выход проверен» (`verify`). Ослаблять её нельзя.
 - Значения по умолчанию (`--quality 85`, `--crf 33`, `--audio-quality 4`) меняются только по слову Сергея.
 
-Общие правила Сергея — в `~/.claude/CLAUDE.md` и `~/.claude/rules/` (источник — репо `hq`). Здесь — только специфика проекта.
+Общие правила Сергея — в `~/.claude/CLAUDE.md` и `~/.claude/rules/`. Здесь — только специфика проекта.
